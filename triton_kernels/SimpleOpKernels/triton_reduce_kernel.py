@@ -4,6 +4,8 @@ import triton
 import triton.language as tl
 
 
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 @triton.jit
 def matrix_sum_kernel(x_ptr, z_ptr, M, B0: tl.constexpr=32):
     pid_0 = tl.program_id(0)  # Row index
@@ -44,6 +46,48 @@ def final_reduce(x_ptr, z_ptr, M, B0: tl.constexpr=32):
 
     tl.store(z_ptr + pid_0, row_sum)
 
+# let's add benchmarking here. For comparison, we will use the torch compile
+# for reduce sum and compare the performance with Triton kernel above, using
+# torch profiler
+def benchmarking():
+    import time
+    import torch
+    import torch.autograd.profiler as profiler
+
+    print(f"========== Benchmarking Torch Compile ==========")
+    inp_matrix = torch.randn(1000, 1000, device=device)
+    matrix = inp_matrix.clone()
+    torch_reduce_sum = torch.compile(torch.sum)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=5, warmup=5, active=20, repeat=1)
+    ) as prof:
+        for _ in range(30):
+            torch_reduce_sum(inp_matrix)
+            torch.cuda.synchronize(device)
+            prof.step()
+
+        event_list = prof.key_averages()
+        print(event_list)
+
+    # Triton kernel
+    print(f"========== Benchmarking Triton Kernel ==========")
+    intermediate = torch.zeros((1000,), device=device)
+    output = torch.zeros((1,), device=device)
+    grid = lambda meta: (triton.cdiv(matrix.shape[0], 1),)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=5, warmup=5, active=20, repeat=1)
+    ) as prof:
+        for _ in range(30):
+            matrix_sum_kernel[grid](inp_matrix, intermediate, matrix.shape[1])
+            final_reduce[(1, 1, 1)](intermediate, output, intermediate.shape[0])
+            torch.cuda.synchronize(device)
+            prof.step()
+
+        event_list = prof.key_averages()
+        print(event_list)
+
 
 # Initialize input matrix
 matrix = torch.randn(1000, 1000, device='cuda')
@@ -56,5 +100,7 @@ matrix_sum_kernel[grid](matrix, intermediate, matrix.shape[1])
 final_reduce[(1, 1, 1)](intermediate, output, intermediate.shape[0])
 
 ref_out = matrix.sum()
-print(f"ref out {ref_out}, final outputs {output}")
-assert torch.allclose(output, ref_out, atol=1e-5)
+print(f"Did the kernel match with reference - {torch.allclose(output, ref_out, atol=1e-5)}")
+
+# do benchmarking.
+benchmarking()
