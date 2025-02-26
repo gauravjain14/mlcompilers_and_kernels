@@ -47,7 +47,7 @@ def final_reduce(x_ptr, z_ptr, M, B0: tl.constexpr=32):
     tl.store(z_ptr + pid_0, row_sum)
 
 @triton.jit
-def fused_sum_kernel(x_ptr, z_ptr, M, BLOCK_SIZE_M: tl.constexpr):
+def fused_sum_kernel(x_ptr, z_ptr, M, BLOCK_SIZE_M: tl.constexpr=32):
     pid_0 = tl.program_id(0)  # Row index
     num_cols_blocks = (M + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
 
@@ -66,9 +66,17 @@ def fused_sum_kernel(x_ptr, z_ptr, M, BLOCK_SIZE_M: tl.constexpr):
 
     tl.atomic_add(z_ptr, block_sum)
 
-
+# add triton autotune here.
+@triton.autotune(
+   key=["M"],
+   configs=[
+       triton.Config({'BLOCK_SIZE_M': 32}, num_warps=4),
+       # triton.Config({'BLOCK_SIZE_M': 64}, num_warps=4),
+       # triton.Config({'BLOCK_SIZE_M': 128}, num_warps=8),
+   ],
+)
 @triton.jit
-def fused_sum_kernel_block(x_ptr, z_ptr, M, BLOCK_SIZE_M: tl.constexpr):
+def fused_sum_kernel_block(x_ptr, z_ptr, M, N, BLOCK_SIZE_M: tl.constexpr=128):
     pid_0 = tl.program_id(0)  # Row index
     num_cols_blocks = (M + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
 
@@ -85,7 +93,7 @@ def fused_sum_kernel_block(x_ptr, z_ptr, M, BLOCK_SIZE_M: tl.constexpr):
 
         addr_range = offsets_y[:, None] * M + offsets_x[None, :]
         mask_x = offsets_x < M
-        mask_y = offsets_y < M
+        mask_y = offsets_y < N
         mask = mask_y[:, None] & mask_x[None, :]
         x = tl.load(x_ptr + addr_range, mask=mask, other=0.0)
         block_sum += tl.sum(x)  # Accumulate sum
@@ -124,7 +132,7 @@ def benchmarking():
     print(f"========== Benchmarking Triton Kernel ==========")
     intermediate = torch.zeros((1000,), device=device)
     output = torch.zeros((1,), device=device)
-    grid = lambda meta: (triton.cdiv(matrix.shape[0], 32),)
+    grid = lambda meta: (triton.cdiv(matrix.shape[0], meta['BLOCK_SIZE_M']),)
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CUDA],
         schedule=torch.profiler.schedule(wait=5, warmup=5, active=20, repeat=1)
@@ -132,7 +140,7 @@ def benchmarking():
         for _ in range(30):
             # matrix_sum_kernel[grid](inp_matrix, intermediate, matrix.shape[1])
             # final_reduce[(1, 1, 1)](intermediate, output, intermediate.shape[0])
-            fused_sum_kernel_block[grid](matrix, output, matrix.shape[1], 32)
+            fused_sum_kernel_block[grid](matrix, output, matrix.shape[1], matrix.shape[0])
             torch.cuda.synchronize(device)
             prof.step()
 
@@ -142,16 +150,11 @@ def benchmarking():
 
 # Initialize input matrix
 matrix = torch.randn(1000, 1000, device='cuda')
-intermediate = torch.zeros((1000,), device='cuda')
-output = torch.zeros((1,), device='cuda')
 output_fused = torch.zeros((1,), device='cuda')
 
-# Launch kernel
-grid = lambda meta: (triton.cdiv(matrix.shape[0], 32),)
-# matrix_sum_kernel[grid](matrix, intermediate, matrix.shape[1])
-# final_reduce[(1, 1, 1)](intermediate, output, intermediate.shape[0])
-
-fused_sum_kernel_block[grid](matrix, output_fused, matrix.shape[1], 32)
+# Launch kernel with debug buffer
+grid = lambda meta: (triton.cdiv(matrix.shape[0], meta['BLOCK_SIZE_M']),)
+fused_sum_kernel_block[grid](matrix, output_fused, matrix.shape[1], matrix.shape[0])
 
 ref_out = matrix.sum()
 # print(f"output {output}")
