@@ -46,7 +46,7 @@ def matmul_tiled_large(
         # Is this masking needed if we have the masks in the loads?
         # a_block = tl.where(mask_a, a_block, 0.0)
         # b_block = tl.where(mask_b, b_block, 0.0)        
-        buffer += tl.dot(a_block, b_block)
+        buffer += tl.dot(a_block, b_block, allow_tf32=False)
     
     # write the buffer to the correct position in C with the correct block range
     out_addr = (block_range_m * stride_cm)[:, None] + (block_range_n)[None, :] * stride_cn
@@ -70,11 +70,6 @@ def matmul_triton(a: torch.Tensor, b: torch.Tensor):
 
     # run the tiled large kernel
     c.zero_()
-    print(f"a.shape: {a.shape}, b.shape: {b.shape}, c.shape: {c.shape}")
-    print(f"a.stride(0): {a.stride(0)}, a.stride(1): {a.stride(1)}")
-    print(f"b.stride(0): {b.stride(0)}, b.stride(1): {b.stride(1)}")
-    print(f"c.stride(0): {c.stride(0)}, c.stride(1): {c.stride(1)}")
-
     matmul_tiled_large[grid](
         a_ptr=a,
         b_ptr=b,
@@ -99,7 +94,7 @@ def matmul_triton(a: torch.Tensor, b: torch.Tensor):
     print(f"max diff: {abs_diff.max().item():.3f}, min diff: {abs_diff.min().item():.3f}")
     print(f"avg_error: {avg_error:.3f}")
 
-    assert torch.allclose(c, c_ref, atol=1e-1, rtol=1e-1)
+    assert torch.allclose(c, c_ref, atol=1e-4)
     
     return c
 
