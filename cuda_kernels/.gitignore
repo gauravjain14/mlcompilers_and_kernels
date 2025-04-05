@@ -1,0 +1,14 @@
+*.ptx
+*.cubin
+*.fatbin
+*.obj
+*.o
+*.so
+*.dll
+*.exe
+*.out
+*.a
+
+# Build directories
+build/
+dist/
