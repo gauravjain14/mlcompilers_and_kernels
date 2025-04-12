@@ -114,16 +114,35 @@ int main() {
     CUDA_CHECK(cudaMemcpy(bins, d_bins, nbins * sizeof(int), cudaMemcpyDeviceToHost));
 
     int *ref_bins = (int*)malloc(nbins * sizeof(int));
-    memset(ref_bins, 0, nbins);
+    memset(ref_bins, 0, nbins * sizeof(int));
     // reference bin calculation
-    for (int i=0; i<array_size; i++) {
-        int bin_id = input[i] / nbins_per_block;
-        ref_bins[bin_id] += 1;
+    for (int i = 0; i < array_size; i++) {
+        int ldata = input[i];
+        int binid = ldata; // Use the same logic as the kernel
+
+        // Apply clamping exactly as in the kernel
+        if (ldata < 0)
+            binid = 0;
+        else if (ldata >= nbins)
+            binid = nbins - 1;
+
+        // Ensure the calculated binid is valid before incrementing
+        // (Although the clamping should prevent out-of-bounds if nbins > 0)
+        if (binid >= 0 && binid < nbins) {
+            ref_bins[binid] += 1;
+        } else {
+            // Optional: Handle unexpected cases if necessary
+            // std::cerr << "Warning: Invalid binid " << binid << " for input " << ldata << std::endl;
+        }
     }
 
-    // Now you can check/print the 'bins' array on the host
+    bool mismatch = false; // Flag to track mismatches
     for (int i = 0; i < nbins; i++) {
-        std::cout << bins[i] << " " << ref_bins[i];
+        if (bins[i] != ref_bins[i]) {
+            std::cerr << "Mismatch at index " << i << ": Kernel=" << bins[i] << ", Reference=" << ref_bins[i] << std::endl;
+            mismatch = true;
+            // break;
+        }
     }
     std::cout << std::endl;
 
@@ -132,6 +151,13 @@ int main() {
     cudaFree(d_bins);
     free(input);
     free(bins);
+
+    if (mismatch) {
+        std::cerr << "Error: Histogram verification failed due to mismatches." << std::endl;
+        return 1; // Return non-zero exit code to indicate failure
+    } else {
+        std::cout << "Histogram verification successful!" << std::endl;
+    }
 
     return 0; // Assuming you add the missing parts
 }
