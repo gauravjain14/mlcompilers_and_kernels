@@ -1,4 +1,4 @@
-// Softmax kernel using online algorithm
+// Softmax kernel using blocked max and norm
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,11 +6,13 @@
 #include <algorithm>
 
 
-__global__ void softmax_online_v0(const float* x, float* y, int B, int N) {
+__global__ void calculate_block_max_and_sum(const float* x, float* y, int B, int N) {
     int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     float max_val = -1e30f;
-    extern __shared__ float max_vals[];
+    extern __shared__ float ms[];
+    float *max_vals = ms;
+    float *sum_shmem = ms + blockDim.x;
 
     // Each thread processes multiple elements with stride equal to blockDim.x
     for (int idx = threadIdx.x; idx < B; idx += blockDim.x) {
@@ -18,7 +20,7 @@ __global__ void softmax_online_v0(const float* x, float* y, int B, int N) {
             max_val = fmaxf(max_val, x[blockIdx.x * B + idx]);
         }
     }
-    
+
     // Store the thread's local maximum in shared memory
     max_vals[threadIdx.x] = max_val;
     __syncthreads();
@@ -95,7 +97,7 @@ int main() {
     cudaMemcpy(d_input, h_input, N * sizeof(float), cudaMemcpyHostToDevice);
     
     // Launch kernel with multiple blocks, each processing a subset of data
-    softmax_online_v0<<<num_blocks, threadsPerBlock, sharedMemSize>>>(d_input, d_output, B, N);
+    calculate_block_max_and_sum<<<num_blocks, threadsPerBlock, sharedMemSize>>>(d_input, d_output, B, N);
     
     // Launch kernel to calculate global max
     float* d_global_max;
