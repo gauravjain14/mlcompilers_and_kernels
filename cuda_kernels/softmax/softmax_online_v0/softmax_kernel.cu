@@ -30,10 +30,36 @@ __global__ void softmax_online_v0(const float* x, float* y, int B, int N) {
         }
         __syncthreads();
     }
-    
+
     // Thread 0 writes the final maximum to the output
     if (threadIdx.x == 0) {
         y[blockIdx.x] = max_vals[0];
+    }
+}
+
+__global__ void calculate_global_max(float* block_maxes, float* global_max, int num_blocks) {
+    int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    extern __shared__ float max_vals[];
+
+    // Assume this kernel is launched with a single block
+    float max_val = -1e30f;
+    for (int i = threadIdx.x; i < num_blocks; i += blockDim.x) {
+        max_val = fmaxf(max_val, block_maxes[i]);
+    }
+    
+    max_vals[threadIdx.x] = max_val;
+    __syncthreads();
+
+    for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+        if (threadIdx.x < offset) {
+            max_vals[threadIdx.x] = fmaxf(max_vals[threadIdx.x], max_vals[threadIdx.x + offset]);
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        global_max[0] = max_vals[0];
     }
 }
 
@@ -70,6 +96,11 @@ int main() {
     
     // Launch kernel with multiple blocks, each processing a subset of data
     softmax_online_v0<<<num_blocks, threadsPerBlock, sharedMemSize>>>(d_input, d_output, B, N);
+    
+    // Launch kernel to calculate global max
+    float* d_global_max;
+    cudaMalloc(&d_global_max, sizeof(float));
+    calculate_global_max<<<1, num_blocks, num_blocks * sizeof(float)>>>(d_output, d_global_max, num_blocks);
     
     // Check for kernel launch errors
     cudaStatus = cudaGetLastError();
@@ -113,9 +144,8 @@ int main() {
         // Update the global max
         gpu_max = std::max(gpu_max, h_block_outputs[i]);
     }
-    
-    // Store the final maximum in h_output for consistency
-    h_output[0] = gpu_max;
+
+    cudaMemcpy(h_output, d_global_max, sizeof(float), cudaMemcpyDeviceToHost);
     
     printf("\nGPU final max: %f\n", gpu_max);
     printf("CPU max: %f\n", cpu_max);
