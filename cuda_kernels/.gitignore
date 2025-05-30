@@ -14,3 +14,10 @@ build/
 dist/
 bin/
 
+# ignore any ncu-generated files, csv, json, etc.
+*.csv
+*.json
+*.log
+*.txt
+*.sqlite
+*.nsys-rep
