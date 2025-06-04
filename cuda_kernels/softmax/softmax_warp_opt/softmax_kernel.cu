@@ -73,34 +73,10 @@ __global__ void calculate_global_max(float* block_maxes, float* global_max, int 
     }
 }
 
-// calculating the global sum needs the block-wise max and global max
-__global__ void calculate_global_sum(float* block_sums, float* block_maxes, float* global_sum, float global_max, int num_blocks) {
-    float sum_val = 0.0f;
-    // Each block sum is calculated relative to its own block max
-    // We need to adjust it to be relative to the global max
-    for (int i = threadIdx.x; i < num_blocks; i += blockDim.x) {
-        sum_val += block_sums[i] * expf(block_maxes[i] - global_max);
-    }
-
-    extern __shared__ float sum_vals[];
-    sum_vals[threadIdx.x] = sum_val;
-    __syncthreads();
-
-    for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
-        if (threadIdx.x < offset) {
-            sum_vals[threadIdx.x] += sum_vals[threadIdx.x + offset];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        global_sum[0] = sum_vals[0];
-    }
-}
 
 #define WARP_SIZE 32
 
-__global__ void calculate_global_sum_warp_down(float* block_sums,
+__global__ void calculate_global_sum(float* block_sums,
                                               float* block_maxes,
                                               float* global_sum,
                                               float global_max,
@@ -254,7 +230,7 @@ int main(int argc, char *argv[]) {
     // Now use the host value in the kernel call
     cudaMalloc(&d_global_sum, sizeof(float));
     cudaMalloc(&d_output, N * sizeof(float)); // Allocate memory for final GPU output
-    calculate_global_sum_warp_down<<<1, num_blocks, num_blocks * sizeof(float)>>>(d_block_sum, d_block_max, d_global_sum, host_global_max, num_blocks);
+    calculate_global_sum<<<1, num_blocks, num_blocks * sizeof(float)>>>(d_block_sum, d_block_max, d_global_sum, host_global_max, num_blocks);
     
     // Check for kernel launch errors
     cudaStatus = cudaGetLastError();
