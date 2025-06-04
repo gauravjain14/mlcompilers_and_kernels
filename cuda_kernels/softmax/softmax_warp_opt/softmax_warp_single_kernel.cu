@@ -1,0 +1,347 @@
+// Softmax kernel using blocked max and norm
+#include <cuda_runtime.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <algorithm>
+#include <iostream>
+
+// Unified Softmax Kernel
+__global__ void unified_softmax_kernel(
+    const float* x, float* y,
+    float* g_block_maxes,        // Temporary global storage for max from each block
+    float* g_block_sums,         // Temporary global storage for sum from each block
+    float* g_final_global_max,   // Output for the final global maximum
+    float* g_final_global_sum,   // Output for the final global sum
+    int N,                       // Total number of elements
+    int elements_per_block       // Number of elements processed by each block
+) {
+    extern __shared__ float s_data[];
+    float* s_max_vals = s_data;
+    float* s_sum_vals = s_data + blockDim.x; // Shared memory for max and sum reductions
+
+    // Phase 1: Calculate block-local max and sum
+    float thread_max_val = -1e30f;
+    float thread_sum_val = 0.0f;
+
+    int block_start_idx = blockIdx.x * elements_per_block;
+
+    for (int i = threadIdx.x; i < elements_per_block; i += blockDim.x) {
+        int current_idx = block_start_idx + i;
+        if (current_idx < N) {
+            float val = x[current_idx];
+            float new_max = fmaxf(thread_max_val, val);
+            // Numerically stable online sum calculation
+            thread_sum_val = thread_sum_val * expf(thread_max_val - new_max) + expf(val - new_max);
+            thread_max_val = new_max;
+        }
+    }
+
+    s_max_vals[threadIdx.x] = thread_max_val;
+    s_sum_vals[threadIdx.x] = thread_sum_val;
+    __syncthreads();
+
+    // Parallel reduction within the block for max and sum
+    for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+        if (threadIdx.x < offset) {
+            float m1 = s_max_vals[threadIdx.x];
+            float m2 = s_max_vals[threadIdx.x + offset];
+            float s1_val = s_sum_vals[threadIdx.x];
+            float s2_val = s_sum_vals[threadIdx.x + offset];
+
+            float new_combined_max = fmaxf(m1, m2);
+            s_max_vals[threadIdx.x] = new_combined_max;
+            s_sum_vals[threadIdx.x] = s1_val * expf(m1 - new_combined_max) + s2_val * expf(m2 - new_combined_max);
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        g_block_maxes[blockIdx.x] = s_max_vals[0];
+        g_block_sums[blockIdx.x] = s_sum_vals[0];
+    }
+
+    __syncthreads();
+    __threadfence_block(); // Ensures writes by this block are visible to other blocks
+
+    if (blockIdx.x == 0) {
+        float p_max = -1e30f; // Thread's partial max for the global max reduction
+        for (int i = threadIdx.x; i < gridDim.x; i += blockDim.x) {
+            p_max = fmaxf(p_max, g_block_maxes[i]);
+        }
+        s_max_vals[threadIdx.x] = p_max; // Store partial max in shared memory
+        __syncthreads();
+
+        // Reduce these partial maxes in shared memory
+        for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+            if (threadIdx.x < offset) {
+                s_max_vals[threadIdx.x] = fmaxf(s_max_vals[threadIdx.x], s_max_vals[threadIdx.x + offset]);
+            }
+            __syncthreads();
+        }
+
+        float final_max_val_calc;
+        if (threadIdx.x == 0) {
+            final_max_val_calc = s_max_vals[0];
+            g_final_global_max[0] = final_max_val_calc;
+        }
+        __syncthreads(); // Ensure all threads in block 0 see the final_max_val_calc
+        final_max_val_calc = g_final_global_max[0]; // All threads in block 0 load the value
+
+        // 2.2: Reduce g_block_sums to find final_global_sum, using final_global_max
+        float p_sum = 0.0f; // Thread's partial sum for the global sum reduction
+        for (int i = threadIdx.x; i < gridDim.x; i += blockDim.x) {
+            p_sum += g_block_sums[i] * expf(g_block_maxes[i] - final_max_val_calc);
+        }
+        s_sum_vals[threadIdx.x] = p_sum; // Store partial sum in shared memory
+        __syncthreads();
+
+        // Reduce these partial sums in shared memory
+        for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+            if (threadIdx.x < offset) {
+                s_sum_vals[threadIdx.x] += s_sum_vals[threadIdx.x + offset];
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0) {
+            g_final_global_sum[0] = s_sum_vals[0];
+            __threadfence(); // Make g_final_global_max and g_final_global_sum writes visible globally
+        }
+    }
+
+    __syncthreads();
+
+    float final_max = g_final_global_max[0];
+    float final_sum = g_final_global_sum[0];
+
+    for (int i = threadIdx.x; i < elements_per_block; i += blockDim.x) {
+        int current_idx = block_start_idx + i;
+        if (current_idx < N) {
+            if (final_sum == 0.0f) {
+                 y[current_idx] = 0.0f;
+            } else {
+                y[current_idx] = expf(x[current_idx] - final_max) / final_sum;
+            }
+        }
+    }
+}
+
+
+int main(int argc, char *argv[]) {
+    int N = 10000000;
+    int threadsPerBlock = 64;
+    int num_blocks = 1024;
+
+    // Parse command-line arguments
+    if (argc == 4) {
+        threadsPerBlock = std::atoi(argv[1]);
+        num_blocks = std::atoi(argv[2]);
+        N = std::atoi(argv[3]);
+    } else if (argc != 1) { // Allow no arguments for default values
+        std::cerr << "Usage: " << argv[0] << " <threadsPerBlock> <num_blocks> <N>" << std::endl;
+        std::cerr << "Using default values: N=" << N << ", threadsPerBlock=" << threadsPerBlock << ", num_blocks=" << num_blocks << std::endl;
+    }
+    
+    if (threadsPerBlock <= 0 || num_blocks <=0 || N <= 0) {
+        std::cerr << "Error: N, threadsPerBlock, and num_blocks must be positive." << std::endl;
+        return -1;
+    }
+
+    // if num_blocks * threadsPerBlock is too small for N, it's not an error but could be inefficient.
+    // However, N must be covered. The elements_per_block calculation handles distribution.
+
+    if (threadsPerBlock > 1024) {
+        std::cerr << "Error: threadsPerBlock > 1024" << std::endl;
+        return -1;
+    }
+    
+    // Ensure num_blocks is reasonable, e.g., for fitting block_maxes/sums if block 0 reduces them.
+    // Current approach has block 0 iterate, so no strict limit on num_blocks for shared memory fitting,
+    // but very large num_blocks will make block 0's reduction step long.
+
+    std::cout << "N " << N << " threadsPerBlock " << threadsPerBlock << " num_blocks " << num_blocks << std::endl;
+
+    const int elements_per_block = (N + num_blocks - 1) / num_blocks; // Calculate elements per block for even distribution
+    const int sharedMemSize = 2 * threadsPerBlock * sizeof(float); // For s_max_vals and s_sum_vals
+
+    float* h_input = new float[N];
+    float* h_output = new float[N]; // For final softmax output from GPU
+    float* h_cpu_softmax_output = new float[N]; // For CPU softmax verification
+
+    float* d_input = nullptr;
+    float* d_output = nullptr;
+    float* d_block_maxes = nullptr;    // Temp global storage for block maxes
+    float* d_block_sums = nullptr;     // Temp global storage for block sums
+    float* d_final_global_max = nullptr; // Final global max (scalar)
+    float* d_final_global_sum = nullptr; // Final global sum (scalar)
+
+    float gpu_final_max = 0.0f;
+    float gpu_final_sum = 0.0f;
+    float cpu_max = -1e30f;
+    float cpu_sum = 0.0f;
+    
+    cudaError_t cudaStatus = cudaSuccess;
+
+    // Initialize random input values
+    for (int i = 0; i < N; i++) {
+        h_input[i] = static_cast<float>(rand()) / RAND_MAX * 5.0f - 2.5f; // Values between -2.5 and 2.5
+    }
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    float ms = 0.0f;
+    
+    // Allocate GPU memory
+    cudaStatus = cudaMalloc(&d_input, N * sizeof(float));
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "cudaMalloc d_input failed!\n");}
+    cudaStatus = cudaMalloc(&d_output, N * sizeof(float));
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "cudaMalloc d_output failed!\n"); }
+    cudaStatus = cudaMalloc(&d_block_maxes, num_blocks * sizeof(float));
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "cudaMalloc d_block_maxes failed!\n"); }
+    cudaStatus = cudaMalloc(&d_block_sums, num_blocks * sizeof(float));
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "cudaMalloc d_block_sums failed!\n"); }
+    cudaStatus = cudaMalloc(&d_final_global_max, sizeof(float));
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "cudaMalloc d_final_global_max failed!\n"); }
+    cudaStatus = cudaMalloc(&d_final_global_sum, sizeof(float));
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "cudaMalloc d_final_global_sum failed!\n"); }
+
+    // Copy input data to device
+    cudaStatus = cudaMemcpy(d_input, h_input, N * sizeof(float), cudaMemcpyHostToDevice);
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "cudaMemcpy d_input failed!\n"); }
+
+    // Launch the unified softmax kernel
+    cudaEventRecord(start);
+    unified_softmax_kernel<<<num_blocks, threadsPerBlock, sharedMemSize>>>(
+        d_input, d_output,
+        d_block_maxes, d_block_sums,
+        d_final_global_max, d_final_global_sum,
+        N, elements_per_block
+    );
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop); // Wait for kernel to complete
+    cudaEventElapsedTime(&ms, start, stop);
+    printf(">> Unified Softmax Kernel time: %f ms\n", ms);
+
+    // Check for kernel launch errors
+    cudaStatus = cudaGetLastError();
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "Unified softmax kernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+    }
+    cudaStatus = cudaDeviceSynchronize(); // Explicit sync after kernel
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaDeviceSynchronize after unified kernel failed: %s\n", cudaGetErrorString(cudaStatus));
+    }
+
+    // Copy results back to host
+    cudaStatus = cudaMemcpy(h_output, d_output, N * sizeof(float), cudaMemcpyDeviceToHost);
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "cudaMemcpy h_output failed!\n"); }
+    cudaStatus = cudaMemcpy(&gpu_final_max, d_final_global_max, sizeof(float), cudaMemcpyDeviceToHost);
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "cudaMemcpy gpu_final_max failed!\n"); }
+    cudaStatus = cudaMemcpy(&gpu_final_sum, d_final_global_sum, sizeof(float), cudaMemcpyDeviceToHost);
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "cudaMemcpy gpu_final_sum failed!\n"); }
+    
+    // --- CPU Softmax Calculation for Verification ---
+    // 1. Calculate CPU global max
+    for (int i = 0; i < N; i++) {
+        cpu_max = std::max(cpu_max, h_input[i]);
+    }
+
+    // 2. Calculate CPU global sum (using the CPU global max)
+    cpu_sum = 0.0f;
+    for (int i = 0; i < N; i++) {
+        cpu_sum += expf(h_input[i] - cpu_max);
+    }
+    
+    // 3. Calculate CPU softmax output
+    for (int i = 0; i < N; i++) {
+        if (cpu_sum == 0.0f) { // Avoid division by zero
+             h_cpu_softmax_output[i] = 0.0f; 
+        } else {
+            h_cpu_softmax_output[i] = expf(h_input[i] - cpu_max) / cpu_sum;
+        }
+    }
+    
+    // Optional: Detailed block-wise comparison (if d_block_maxes and d_block_sums are copied from GPU)
+    if (false) { // Set to true to enable block-wise debug output
+        float* h_block_maxes = new float[num_blocks];
+        float* h_block_sums = new float[num_blocks];
+        cudaMemcpy(h_block_maxes, d_block_maxes, num_blocks * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_block_sums, d_block_sums, num_blocks * sizeof(float), cudaMemcpyDeviceToHost);
+        
+        // Note: CPU block sums here would need to be re-calculated based on the *exact* same
+        // online algorithm and block partitioning as the GPU for a fair comparison.
+        // The current CPU verification directly computes global max/sum.
+        std::cout << "\nGPU Block-wise intermediate results (first few blocks):" << std::endl;
+        for (int i = 0; i < std::min(num_blocks, 5); i++) {
+            std::cout << "Block " << i << ": GPU max = " << h_block_maxes[i] 
+                      << ", GPU sum (for its max) = " << h_block_sums[i] << std::endl;
+        }
+        delete[] h_block_maxes;
+        delete[] h_block_sums;
+    }
+    
+    // Print and compare final global results
+    printf("\nGPU final global max: %f, CPU final global max: %f\n", gpu_final_max, cpu_max);
+    printf("GPU final global sum: %f, CPU final global sum: %f\n", gpu_final_sum, cpu_sum);
+    
+    bool max_correct = fabs(gpu_final_max - cpu_max) < 1e-4; // Adjusted tolerance slightly for single vs multi kernel floating point paths
+    bool sum_correct = fabs(gpu_final_sum - cpu_sum) < 1e-3; // Sum can accumulate more error
+    
+    if (max_correct) {
+        printf("Global max test PASSED!\n");
+    } else {
+        printf("Global max test FAILED! Difference: %e\n", fabs(gpu_final_max - cpu_max));
+    }
+    
+    if (sum_correct) {
+        printf("Global sum test PASSED!\n");
+    } else {
+        printf("Global sum test FAILED! Difference: %e\n", fabs(gpu_final_sum - cpu_sum));
+    }
+
+    // Compare final softmax output
+    bool softmax_correct = true;
+    float max_softmax_diff = 0.0f;
+    int mismatch_count = 0;
+    const int max_mismatches_to_print = 5;
+
+    for (int i = 0; i < N; i++) {
+        float diff = fabs(h_output[i] - h_cpu_softmax_output[i]);
+        if (diff > 1e-4f) { // Tolerance for softmax elements
+            softmax_correct = false;
+            if (mismatch_count < max_mismatches_to_print) {
+                 printf("Mismatch at index %d: GPU_softmax = %.6e, CPU_softmax = %.6e, Diff = %.3e (input val: %.3f)\n",
+                        i, h_output[i], h_cpu_softmax_output[i], diff, h_input[i]);
+            }
+            mismatch_count++;
+        }
+        if (diff > max_softmax_diff) {
+            max_softmax_diff = diff;
+        }
+    }
+
+    if (softmax_correct) {
+        printf("\nFinal Softmax Output Validation PASSED!\n");
+    } else {
+        printf("\nFinal Softmax Output Validation FAILED! Max difference: %e. Total mismatches: %d / %d elements.\n", max_softmax_diff, mismatch_count, N);
+    }
+    fflush(stdout); 
+
+    // Cleanup
+    cudaFree(d_input);
+    cudaFree(d_output);
+    cudaFree(d_block_maxes);
+    cudaFree(d_block_sums);
+    cudaFree(d_final_global_max);
+    cudaFree(d_final_global_sum);
+    delete[] h_input;
+    delete[] h_output;
+    delete[] h_cpu_softmax_output;
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    return (softmax_correct && max_correct && sum_correct) ? 0 : 1;
+}
