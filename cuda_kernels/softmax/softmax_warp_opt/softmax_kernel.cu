@@ -100,92 +100,6 @@ __global__ void calculate_global_sum(float* block_sums, float* block_maxes, floa
 
 #define WARP_SIZE 32
 
-__global__ void calculate_global_sum_warp(float* block_sums,
-                                        float* block_maxes,
-                                        float* global_sum,
-                                        float global_max,
-                                        int num_blocks) {
-    // Assume this kernel is launched with a single block
-    extern __shared__ float sum_vals[];
-
-    float sum_val = 0.0f;
-    for (int i = threadIdx.x; i < num_blocks; i += blockDim.x) {
-        sum_val += block_sums[i] * expf(block_maxes[i] - global_max);
-    }
-
-    sum_vals[threadIdx.x] = sum_val;
-    __syncthreads();
-
-    int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
-
-    int warpId = threadIdx.x / WARP_SIZE;
-    int laneId = threadIdx.x & 0x1f;
-    float calling_value = sum_vals[threadIdx.x];
-
-    unsigned int active_mask = __ballot_sync(0xFFFFFFFF, threadIdx.x < num_blocks);
-
-    for (int i = 1; i < WARP_SIZE; i <<= 1) {
-        // a lot of these computations are redundant but not that we could have used the lanes anyway.
-        float partner_value = __shfl_xor_sync(active_mask, calling_value, i, WARP_SIZE);
-        calling_value += partner_value;
-    }
-
-    if (laneId == 0) {
-        // overwrite the value in the shared memory with the warp sum
-        sum_vals[warpId] = calling_value;
-    }
-    __syncthreads();
-
-    if (warpId == 0) {
-        float laneVal = (laneId < num_warps)
-                        ? sum_vals[laneId]
-                        : 0.0f;
-
-        unsigned int finalMask = __ballot_sync(
-            0xFFFFFFFF,
-            (laneId < num_warps)
-        );
-
-        // Find optimal starting offset for num_warps
-        int max_warp_offset = 1;
-        while (max_warp_offset < num_warps) {
-            max_warp_offset <<= 1;
-        }
-        max_warp_offset >>= 1;
-
-        // Use __shfl_down_sync for the final cross-warp reduction
-        for (int offset = max_warp_offset; offset > 0; offset >>= 1) {
-            float partner = __shfl_down_sync(finalMask, laneVal, offset, WARP_SIZE);
-            laneVal += partner;
-        }
-
-        // Finally, lane 0 of warp 0 has the sum of all "warp sums."  Write to global_sum[0].
-        if (laneId == 0) {
-            global_sum[0] = laneVal;
-        }
-    }
-}
-
-__global__ void reduction_down(int* input_data, int* output_sums, int num_elements, long long *active_mask) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (tid >= num_elements) {
-        return;
-    }
-
-    int laneId = threadIdx.x & 0x1f;
-    int calling_value = (tid < num_elements) ? input_data[tid] : 0;
-
-    const unsigned int full_mask = 0xFFFFFFFF;
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        calling_value += __shfl_down_sync(full_mask, calling_value, offset);
-    }
-
-    if (laneId == 0) {
-        output_sums[blockIdx.x] = calling_value;
-    }
-}
-
 __global__ void calculate_global_sum_warp_down(float* block_sums,
                                               float* block_maxes,
                                               float* global_sum,
@@ -199,35 +113,30 @@ __global__ void calculate_global_sum_warp_down(float* block_sums,
         sum_val += block_sums[i] * expf(block_maxes[i] - global_max);
     }
 
-    sum_vals[threadIdx.x] = sum_val;
-    __syncthreads();
-
-    int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
 
     int warpId = threadIdx.x / WARP_SIZE;
     int laneId = threadIdx.x & 0x1f;
-    // float calling_value = sum_vals[threadIdx.x];
-    float calling_value = (threadIdx.x < num_blocks) ? sum_vals[threadIdx.x] : 0.0f;
 
     const unsigned int active_mask = 0xFFFFFFFF;
     for (int offset = 16; offset > 0; offset >>= 1) {
-        calling_value += __shfl_down_sync(active_mask, calling_value, offset);
+        sum_val += __shfl_down_sync(active_mask, sum_val, offset);
     }
 
     if (laneId == 0) {
         // overwrite the value in the shared memory with the warp sum
-        sum_vals[warpId] = calling_value;
+        sum_vals[warpId] = sum_val;
     }
     __syncthreads();
 
     // Final reduction across warp results - only warp 0 participates
     if (warpId == 0) {
+        int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
         float laneVal = (laneId < num_warps)
                         ? sum_vals[laneId]
                         : 0.0f;
 
         // Use __shfl_down_sync for the final cross-warp reduction
-        for (int offset = 16; offset > 0; offset >>= 1) {
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
             laneVal += __shfl_down_sync(active_mask, laneVal, offset);
         }
 
@@ -248,9 +157,9 @@ __global__ void softmax_kernel(float* x, float* y, float global_max, float globa
 
 
 int main(int argc, char *argv[]) {
-    int N = 1024;
+    int N = 10000000;
     int threadsPerBlock = 64;
-    int num_blocks = 8;
+    int num_blocks = 1024;
 
     // Parse command-line arguments
     if (argc == 4) {
@@ -309,11 +218,6 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < N; i++) {
         h_input[i] = static_cast<float>(rand()) / RAND_MAX * 5.0f - 2.5f;
     }
-
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    float ms = 0.0f;
     
     cudaMalloc(&d_input, N * sizeof(float));
     cudaMalloc(&d_block_max, num_blocks * sizeof(float));
@@ -322,46 +226,35 @@ int main(int argc, char *argv[]) {
     cudaMemcpy(d_input, h_input, N * sizeof(float), cudaMemcpyHostToDevice);
     
     // Launch kernel with multiple blocks, each processing a subset of data
-    cudaEventRecord(start);
     calculate_block_max_and_sum<<<num_blocks, threadsPerBlock, sharedMemSize>>>(d_input, d_block_max, d_block_sum, B, N);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&ms, start, stop);
-    printf(">> GPU block max and sum time: %f ms\n", ms);
-    
+
     // Allocate memory for block sums for debugging
     float* h_cpu_softmax_output = new float[N]; // For CPU softmax verification
     block_sum = new float[num_blocks];
     cudaMemcpy(block_sum, d_block_sum, num_blocks * sizeof(float), cudaMemcpyDeviceToHost);
     
     // Print initial block sums
-    std::cout << "Initial block sums:" << std::endl;
-    for (int i = 0; i < num_blocks; i++) {
-        std::cout << "Block " << i << ": sum = " << block_sum[i] << std::endl;
+    if (false) {
+        std::cout << "Initial block sums:" << std::endl;
+        for (int i = 0; i < num_blocks; i++) {
+            std::cout << "Block " << i << ": sum = " << block_sum[i] << std::endl;
+        }
     }
 
     // Launch kernel to calculate global max
     cudaMalloc(&d_global_max, sizeof(float));
-    cudaEventRecord(start);
     calculate_global_max<<<1, num_blocks, num_blocks * sizeof(float)>>>(d_block_max, d_global_max, num_blocks);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&ms, start, stop);
-    printf(">> GPU global max time: %f ms\n", ms);
 
     // Get the global max value from device to use in the next kernel
     cudaMemcpy(&gpu_max, d_global_max, sizeof(float), cudaMemcpyDeviceToHost);
     float host_global_max = gpu_max;  // Use the same value for the kernel call
     
+    std::cout << " num_blocks " << num_blocks << std::endl;
+
     // Now use the host value in the kernel call
     cudaMalloc(&d_global_sum, sizeof(float));
     cudaMalloc(&d_output, N * sizeof(float)); // Allocate memory for final GPU output
-    cudaEventRecord(start);
     calculate_global_sum_warp_down<<<1, num_blocks, num_blocks * sizeof(float)>>>(d_block_sum, d_block_max, d_global_sum, host_global_max, num_blocks);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&ms, start, stop);
-    printf(">> GPU global sum time: %f ms\n", ms);
     
     // Check for kernel launch errors
     cudaStatus = cudaGetLastError();
@@ -379,12 +272,7 @@ int main(int argc, char *argv[]) {
     cudaMemcpy(&gpu_sum, d_global_sum, sizeof(float), cudaMemcpyDeviceToHost);
 
     // Launch the final softmax kernel
-    cudaEventRecord(start);
     softmax_kernel<<<num_blocks, threadsPerBlock>>>(d_input, d_output, gpu_max, gpu_sum, N);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&ms, start, stop);
-    printf(">> GPU softmax time: %f ms\n", ms);
 
     cudaStatus = cudaGetLastError();
     if (cudaStatus != cudaSuccess) {
@@ -442,15 +330,17 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    std::cout << "\nBlock-wise comparison:" << std::endl;
-    for (int i = 0; i < num_blocks; i++) {
-        float block_max;
-        cudaMemcpy(&block_max, &d_block_max[i], sizeof(float), cudaMemcpyDeviceToHost);
-        
-        std::cout << "Block " << i << ": GPU max = " << block_max 
-                  << ", CPU max = " << cpu_block_maxes[i] << std::endl;
-        std::cout << "Block " << i << ": GPU sum = " << block_sum[i] 
-                  << ", CPU sum = " << cpu_block_sums[i] << std::endl;
+    if (false) {
+        std::cout << "\nBlock-wise comparison:" << std::endl;
+        for (int i = 0; i < num_blocks; i++) {
+            float block_max;
+            cudaMemcpy(&block_max, &d_block_max[i], sizeof(float), cudaMemcpyDeviceToHost);
+            
+            std::cout << "Block " << i << ": GPU max = " << block_max 
+                    << ", CPU max = " << cpu_block_maxes[i] << std::endl;
+            std::cout << "Block " << i << ": GPU sum = " << block_sum[i] 
+                        << ", CPU sum = " << cpu_block_sums[i] << std::endl;
+        }
     }
     
     // Print and compare results

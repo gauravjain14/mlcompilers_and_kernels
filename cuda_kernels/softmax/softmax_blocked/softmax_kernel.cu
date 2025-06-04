@@ -108,9 +108,9 @@ __global__ void softmax_kernel(float* x, float* y, float global_max, float globa
 
 
 int main(int argc, char *argv[]) {
-    int N = 1024;
-    int threadsPerBlock = 128;
-    int num_blocks = 8;
+    int N = 10000000;
+    int threadsPerBlock = 64;
+    int num_blocks = 1024;
 
     // Parse command-line arguments
     if (argc == 4) {
@@ -185,9 +185,11 @@ int main(int argc, char *argv[]) {
     cudaMemcpy(block_sum, d_block_sum, num_blocks * sizeof(float), cudaMemcpyDeviceToHost);
     
     // Print initial block sums
-    std::cout << "Initial block sums:" << std::endl;
-    for (int i = 0; i < num_blocks; i++) {
-        std::cout << "Block " << i << ": sum = " << block_sum[i] << std::endl;
+    if (false) {
+        std::cout << "Initial block sums:" << std::endl;
+        for (int i = 0; i < num_blocks; i++) {
+            std::cout << "Block " << i << ": sum = " << block_sum[i] << std::endl;
+        }
     }
 
     // Launch kernel to calculate global max
@@ -220,6 +222,7 @@ int main(int argc, char *argv[]) {
 
     // Launch the final softmax kernel
     softmax_kernel<<<num_blocks, threadsPerBlock>>>(d_input, d_output, gpu_max, gpu_sum, N);
+
     cudaStatus = cudaGetLastError();
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "softmax_kernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
@@ -276,15 +279,17 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    std::cout << "\nBlock-wise comparison:" << std::endl;
-    for (int i = 0; i < num_blocks; i++) {
-        float block_max;
-        cudaMemcpy(&block_max, &d_block_max[i], sizeof(float), cudaMemcpyDeviceToHost);
-        
-        std::cout << "Block " << i << ": GPU max = " << block_max 
-                  << ", CPU max = " << cpu_block_maxes[i] << std::endl;
-        std::cout << "Block " << i << ": GPU sum = " << block_sum[i] 
-                  << ", CPU sum = " << cpu_block_sums[i] << std::endl;
+    if (false) {
+        std::cout << "\nBlock-wise comparison:" << std::endl;
+        for (int i = 0; i < num_blocks; i++) {
+            float block_max;
+            cudaMemcpy(&block_max, &d_block_max[i], sizeof(float), cudaMemcpyDeviceToHost);
+            
+            std::cout << "Block " << i << ": GPU max = " << block_max 
+                    << ", CPU max = " << cpu_block_maxes[i] << std::endl;
+            std::cout << "Block " << i << ": GPU sum = " << block_sum[i] 
+                    << ", CPU sum = " << cpu_block_sums[i] << std::endl;
+        }
     }
     
     // Print and compare results
