@@ -7,6 +7,22 @@
 #include <iostream>
 
 // Unified Softmax Kernel
+// WLP: Helper device function for a warp-level reduction to find the maximum.
+__device__ inline float warp_reduce_max(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+    }
+    return val;
+}
+
+// WLP: Helper device function for a warp-level reduction for a sum.
+__device__ inline float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
 __global__ void unified_softmax_kernel(
     const float* x, float* y,
     float* g_block_maxes,        // Temporary global storage for max from each block
@@ -17,8 +33,13 @@ __global__ void unified_softmax_kernel(
     int elements_per_block       // Number of elements processed by each block
 ) {
     extern __shared__ float s_data[];
+    // WLP: Shared memory is now only for communication between warps, not all threads.
     float* s_max_vals = s_data;
-    float* s_sum_vals = s_data + blockDim.x; // Shared memory for max and sum reductions
+    float* s_sum_vals = s_data + (blockDim.x / 32); // Size is num_warps
+
+    // WLP: Common warp/lane IDs for reductions
+    int warpId = threadIdx.x / 32;
+    int laneId = threadIdx.x % 32;
 
     // Phase 1: Calculate block-local max and sum
     float thread_max_val = -1e30f;
@@ -37,81 +58,111 @@ __global__ void unified_softmax_kernel(
         }
     }
 
-    s_max_vals[threadIdx.x] = thread_max_val;
-    s_sum_vals[threadIdx.x] = thread_sum_val;
+    // WLP: START of updated block-local reduction
+    // This is more complex than a simple sum/max because the combination logic is specific.
+    // 1. Intra-warp reduction for the combined max/sum
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float partner_max = __shfl_down_sync(0xFFFFFFFF, thread_max_val, offset);
+        float partner_sum = __shfl_down_sync(0xFFFFFFFF, thread_sum_val, offset);
+        
+        if (laneId < offset) { // Active threads combine results
+            float new_combined_max = fmaxf(thread_max_val, partner_max);
+            thread_sum_val = thread_sum_val * expf(thread_max_val - new_combined_max) + 
+                             partner_sum * expf(partner_max - new_combined_max);
+            thread_max_val = new_combined_max;
+        }
+    }
+
+    // 2. Inter-warp reduction
+    // Lane 0 of each warp writes its partial result to shared memory
+    if (laneId == 0) {
+        s_max_vals[warpId] = thread_max_val;
+        s_sum_vals[warpId] = thread_sum_val;
+    }
     __syncthreads();
 
-    // Parallel reduction within the block for max and sum
-    for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
-        if (threadIdx.x < offset) {
-            float m1 = s_max_vals[threadIdx.x];
-            float m2 = s_max_vals[threadIdx.x + offset];
-            float s1_val = s_sum_vals[threadIdx.x];
-            float s2_val = s_sum_vals[threadIdx.x + offset];
+    // Warp 0 performs the final reduction on the partials from each warp
+    if (warpId == 0) {
+        int num_warps = blockDim.x / 32;
+        // Load partials from shared memory
+        thread_max_val = (laneId < num_warps) ? s_max_vals[laneId] : -1e30f;
+        thread_sum_val = (laneId < num_warps) ? s_sum_vals[laneId] : 0.0f;
 
-            float new_combined_max = fmaxf(m1, m2);
-            s_max_vals[threadIdx.x] = new_combined_max;
-            s_sum_vals[threadIdx.x] = s1_val * expf(m1 - new_combined_max) + s2_val * expf(m2 - new_combined_max);
+        // Perform final combined reduction within warp 0
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float partner_max = __shfl_down_sync(0xFFFFFFFF, thread_max_val, offset);
+            float partner_sum = __shfl_down_sync(0xFFFFFFFF, thread_sum_val, offset);
+
+            if (laneId < offset) {
+                float new_combined_max = fmaxf(thread_max_val, partner_max);
+                thread_sum_val = thread_sum_val * expf(thread_max_val - new_combined_max) + 
+                                 partner_sum * expf(partner_max - new_combined_max);
+                thread_max_val = new_combined_max;
+            }
         }
-        __syncthreads();
     }
+    // WLP: END of updated block-local reduction
 
     if (threadIdx.x == 0) {
-        g_block_maxes[blockIdx.x] = s_max_vals[0];
-        g_block_sums[blockIdx.x] = s_sum_vals[0];
+        g_block_maxes[blockIdx.x] = thread_max_val;
+        g_block_sums[blockIdx.x] = thread_sum_val;
     }
 
     __syncthreads();
-    __threadfence_block(); // Ensures writes by this block are visible to other blocks
+    __threadfence_block();
 
+    // WLP: Phase 2.1: Final global max reduction (only in block 0)
     if (blockIdx.x == 0) {
-        float p_max = -1e30f; // Thread's partial max for the global max reduction
+        float p_max = -1e30f;
         for (int i = threadIdx.x; i < gridDim.x; i += blockDim.x) {
             p_max = fmaxf(p_max, g_block_maxes[i]);
         }
-        s_max_vals[threadIdx.x] = p_max; // Store partial max in shared memory
+        
+        // WLP: Intra-warp max reduction
+        p_max = warp_reduce_max(p_max);
+        if (laneId == 0) s_max_vals[warpId] = p_max;
         __syncthreads();
-
-        // Reduce these partial maxes in shared memory
-        for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
-            if (threadIdx.x < offset) {
-                s_max_vals[threadIdx.x] = fmaxf(s_max_vals[threadIdx.x], s_max_vals[threadIdx.x + offset]);
-            }
-            __syncthreads();
+        
+        // WLP: Inter-warp max reduction (done by warp 0)
+        if (warpId == 0) {
+            p_max = (laneId < (blockDim.x / 32)) ? s_max_vals[laneId] : -1e30f;
+            p_max = warp_reduce_max(p_max);
         }
-
+        
         float final_max_val_calc;
         if (threadIdx.x == 0) {
-            final_max_val_calc = s_max_vals[0];
+            final_max_val_calc = p_max; // The result from the reduction
             g_final_global_max[0] = final_max_val_calc;
         }
-        __syncthreads(); // Ensure all threads in block 0 see the final_max_val_calc
-        final_max_val_calc = g_final_global_max[0]; // All threads in block 0 load the value
+        __syncthreads();
+        final_max_val_calc = g_final_global_max[0];
 
-        // 2.2: Reduce g_block_sums to find final_global_sum, using final_global_max
-        float p_sum = 0.0f; // Thread's partial sum for the global sum reduction
+        // WLP: Phase 2.2: Final global sum reduction (only in block 0)
+        float p_sum = 0.0f;
         for (int i = threadIdx.x; i < gridDim.x; i += blockDim.x) {
             p_sum += g_block_sums[i] * expf(g_block_maxes[i] - final_max_val_calc);
         }
-        s_sum_vals[threadIdx.x] = p_sum; // Store partial sum in shared memory
+        
+        // WLP: Intra-warp sum reduction
+        p_sum = warp_reduce_sum(p_sum);
+        if (laneId == 0) s_sum_vals[warpId] = p_sum;
         __syncthreads();
-
-        // Reduce these partial sums in shared memory
-        for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
-            if (threadIdx.x < offset) {
-                s_sum_vals[threadIdx.x] += s_sum_vals[threadIdx.x + offset];
-            }
-            __syncthreads();
+        
+        // WLP: Inter-warp sum reduction (done by warp 0)
+        if (warpId == 0) {
+            p_sum = (laneId < (blockDim.x / 32)) ? s_sum_vals[laneId] : 0.0f;
+            p_sum = warp_reduce_sum(p_sum);
         }
-
+        
         if (threadIdx.x == 0) {
-            g_final_global_sum[0] = s_sum_vals[0];
-            __threadfence(); // Make g_final_global_max and g_final_global_sum writes visible globally
+            g_final_global_sum[0] = p_sum; // The result from the reduction
+            __threadfence();
         }
     }
 
     __syncthreads();
 
+    // Phase 3: Final output calculation (unchanged)
     float final_max = g_final_global_max[0];
     float final_sum = g_final_global_sum[0];
 
