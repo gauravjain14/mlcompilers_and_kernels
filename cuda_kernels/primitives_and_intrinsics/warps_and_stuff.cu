@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 
 
 // __shfl_sync, __shfl_up_sync, __shfl_down_sync, __shfl_xor_sync exchange
@@ -37,9 +38,11 @@ __global__ void butterfly(int* input_data, int* output_sums, int num_elements, l
 
     // Get the active threads mask here before divergence.
     // Could an alternative here be to use __ballot_sync?
-    unsigned int active_threads_mask = __activemask();
+    unsigned int active_threads_mask = 0xFFFFFFFF; // = __activemask();
     // Getting the mask here also gives the right value in active_mask!
-    active_mask[0] = active_threads_mask;
+    // active_mask[0] = active_threads_mask;
+
+    active_mask[0] = __ballot_sync(0xFFFFFFFF, tid < num_elements);
 
     for (int i = 1; i < 32; i <<= 1) {
         // Use the mask 0xFFFFFFFF to ensure that all threads participate in the computation.
@@ -49,6 +52,28 @@ __global__ void butterfly(int* input_data, int* output_sums, int num_elements, l
 
     // After the loop, only lane 0 of each warp will hold the total sum
     // of all values that were originally in that warp.
+    if (laneId == 0) {
+        output_sums[blockIdx.x] = calling_value;
+    }
+}
+
+
+// __shfl_down_sync - using this for sequential reduction
+__global__ void reduction_down(int* input_data, int* output_sums, int num_elements, long long *active_mask) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid >= num_elements) {
+        return;
+    }
+
+    int laneId = threadIdx.x & 0x1f;
+    int calling_value = (tid < num_elements) ? input_data[tid] : 0;
+
+    const unsigned int full_mask = 0xFFFFFFFF;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        calling_value += __shfl_down_sync(full_mask, calling_value, offset);
+    }
+
     if (laneId == 0) {
         output_sums[blockIdx.x] = calling_value;
     }
@@ -152,8 +177,86 @@ int main() {
     printf("Active mask: %lld\n", h_active_mask);
     printf("\n");
 
+    // Test the reduction_down function with the same 12 elements
+    printf("Testing reduction_down with 12 elements:\n");
+    int *d_output_sums_down;
+    cudaMalloc(&d_output_sums_down, sizeof(int));
+    
+    long long *d_active_mask_down;
+    cudaMalloc(&d_active_mask_down, sizeof(long long));
+    
+    reduction_down<<< 1, 12 >>>(d_values_6, d_output_sums_down, 12, d_active_mask_down);
+    cudaDeviceSynchronize();
+    
+    int h_sum_down;
+    cudaMemcpy(&h_sum_down, d_output_sums_down, sizeof(int), cudaMemcpyDeviceToHost);
+    
+    long long h_active_mask_down;
+    cudaMemcpy(&h_active_mask_down, d_active_mask_down, sizeof(long long), cudaMemcpyDeviceToHost);
+    
+    printf("Reduction_down GPU result: %d\n", h_sum_down);
+    printf("Expected CPU result: %d\n", expected_sum_6);
+    printf("Verification: %s\n", (h_sum_down == expected_sum_6) ? "PASS" : "FAIL");
+    printf("Active mask: %lld\n", h_active_mask_down);
+    printf("Match with butterfly result: %s\n", (h_sum_down == h_sum_6) ? "YES" : "NO");
+    printf("\n");
+
+    // Test reduction_down with 200 random values
+    printf("Testing reduction_down with 200 random values:\n");
+    
+    const int test_size = 23;
+    int test_values[test_size];
+    
+    // Generate random values using C++ random number generation
+    srand(42);  // Fixed seed for reproducible results
+    for (int i = 0; i < test_size; i++) {
+        test_values[i] = (rand() % 2000) - 1000;  // Random values between -1000 and 999
+    }
+    
+    // Calculate expected CPU result
+    int cpu_sum = 0;
+    for (int i = 0; i < test_size; i++) {
+        cpu_sum += test_values[i];
+    }
+    printf("...\n");
+    printf("CPU calculated sum: %d\n", cpu_sum);
+    
+    // Allocate GPU memory
+    int *d_test_values;
+    cudaMalloc(&d_test_values, test_size * sizeof(int));
+    cudaMemcpy(d_test_values, test_values, test_size * sizeof(int), cudaMemcpyHostToDevice);
+    
+    int *d_gpu_result;
+    cudaMalloc(&d_gpu_result, sizeof(int));
+    
+    // Run reduction_down kernel
+    reduction_down<<< 1, test_size >>>(d_test_values, d_gpu_result, test_size, d_active_mask_down);
+    cudaDeviceSynchronize();
+    
+    // Get GPU result
+    int gpu_result;
+    cudaMemcpy(&gpu_result, d_gpu_result, sizeof(int), cudaMemcpyDeviceToHost);
+    
+    printf("GPU reduction_down result: %d\n", gpu_result);
+    printf("Expected CPU result: %d\n", cpu_sum);
+    printf("Results match: %s\n", (gpu_result == cpu_sum) ? "YES" : "NO");
+    
+    if (gpu_result != cpu_sum) {
+        printf("ERROR: Implementation does not handle arrays larger than warp size correctly!\n");
+        printf("Difference: %d\n", cpu_sum - gpu_result);
+    }
+    
+    // Clean up
+    cudaFree(d_test_values);
+    cudaFree(d_gpu_result);
+    printf("\n");
+
     cudaFree(d_values);
     cudaFree(d_output_sums);
     cudaFree(d_values_6);
+    cudaFree(d_output_sums_6);
+    cudaFree(d_active_mask_6);
+    cudaFree(d_output_sums_down);
+    cudaFree(d_active_mask_down);
     return 0;
 }
