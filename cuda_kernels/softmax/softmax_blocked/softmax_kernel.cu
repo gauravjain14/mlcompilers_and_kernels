@@ -98,18 +98,20 @@ __global__ void calculate_global_sum(float* block_sums, float* block_maxes, floa
     }
 }
 
-__global__ void softmax_kernel(float* x, float* y, float global_max, float global_sum, int N) {
-    int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (thread_idx < N) {
-        y[thread_idx] = expf(x[thread_idx] - global_max) / global_sum;
+__global__ void apply_softmax(const float* x, float* y, float global_max, float global_sum, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+
+    // Use a grid-stride loop for complete generality
+    for (int j = i; j < N; j += stride) {
+       y[j] = expf(x[j] - global_max) / global_sum;
     }
 }
 
 
 int main(int argc, char *argv[]) {
     int N = 10000000;
-    int threadsPerBlock = 64;
+    int threadsPerBlock = 256;
     int num_blocks = 1024;
 
     // Parse command-line arguments
@@ -167,7 +169,7 @@ int main(int argc, char *argv[]) {
 
     // Initialize random input values
     for (int i = 0; i < N; i++) {
-        h_input[i] = static_cast<float>(rand()) / RAND_MAX * 5.0f - 2.5f;
+        h_input[i] = static_cast<float>(rand()) / RAND_MAX * 100.0f;
     }
     
     cudaMalloc(&d_input, N * sizeof(float));
@@ -184,13 +186,10 @@ int main(int argc, char *argv[]) {
     block_sum = new float[num_blocks];
     cudaMemcpy(block_sum, d_block_sum, num_blocks * sizeof(float), cudaMemcpyDeviceToHost);
     
-    // Print initial block sums
-    if (false) {
-        std::cout << "Initial block sums:" << std::endl;
-        for (int i = 0; i < num_blocks; i++) {
-            std::cout << "Block " << i << ": sum = " << block_sum[i] << std::endl;
-        }
-    }
+    // Declare variable before any goto statements to avoid C++ scoping issues
+    float cpu_sum_inv = 0.0f;
+    float cpu_sum_gpu = 0.0f;
+    float gpu_sum_gpu = 0.0f;
 
     // Launch kernel to calculate global max
     cudaMalloc(&d_global_max, sizeof(float));
@@ -221,7 +220,8 @@ int main(int argc, char *argv[]) {
     cudaMemcpy(&gpu_sum, d_global_sum, sizeof(float), cudaMemcpyDeviceToHost);
 
     // Launch the final softmax kernel
-    softmax_kernel<<<num_blocks, threadsPerBlock>>>(d_input, d_output, gpu_max, gpu_sum, N);
+    std::cout << "Launching softmax kernel with grid dimensions: " << num_blocks << " x 1 x 1" << std::endl;
+    apply_softmax<<<num_blocks, threadsPerBlock>>>(d_input, d_output, gpu_max, gpu_sum, N);
 
     cudaStatus = cudaGetLastError();
     if (cudaStatus != cudaSuccess) {
@@ -242,6 +242,27 @@ int main(int argc, char *argv[]) {
         cpu_max = std::max(cpu_max, h_input[i]);
     }
     
+    // implement the softmax on the cpu
+    cpu_sum = 0.0f;
+    for (int i = 0; i < N; i++) {
+        cpu_sum += expf(h_input[i] - cpu_max);
+    }
+    
+    // Calculate CPU softmax output for verification
+    cpu_sum_inv = 1.0f / cpu_sum;
+    for (int i = 0; i < N; i++) {
+        h_cpu_softmax_output[i] = expf(h_input[i] - cpu_max) * cpu_sum_inv;
+    }
+
+    // Calculate the sum of the cpu softmax output and the sum of the gpu softmax output and print them.
+    for (int i = 0; i < N; i++) {
+        cpu_sum_gpu += h_cpu_softmax_output[i];
+        gpu_sum_gpu += h_output[i];
+    }
+    std::cout << "CPU sum: " << cpu_sum_gpu << " GPU sum: " << gpu_sum_gpu << std::endl;
+
+    /*
+    // Leaving this here because I am too lazy to remove it.
     // Initialize CPU block sums and maxes
     for (int i = 0; i < num_blocks; i++) {
         cpu_block_sums[i] = 0.0f;
@@ -278,7 +299,7 @@ int main(int argc, char *argv[]) {
             h_cpu_softmax_output[i] = expf(h_input[i] - cpu_max) / cpu_sum;
         }
     }
-
+    */
     if (false) {
         std::cout << "\nBlock-wise comparison:" << std::endl;
         for (int i = 0; i < num_blocks; i++) {
@@ -309,6 +330,12 @@ int main(int argc, char *argv[]) {
         printf("Global sum test PASSED!\n");
     } else {
         printf("Global sum test FAILED! Difference: %f\n", fabs(gpu_sum - cpu_sum));
+    }
+
+    // print the output elements starting from index 1024 * 256
+    for (int i = 1024 * 256; i < 1024 * 256 + 10; i++) {
+        std::cout << "Output element " << i << ": " << h_output[i] << std::endl;
+        std::cout << "CPU element " << i << ": " << h_cpu_softmax_output[i] << std::endl;
     }
 
 

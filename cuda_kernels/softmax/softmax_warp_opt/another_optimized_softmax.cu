@@ -63,7 +63,7 @@ __device__ float block_reduce_max(float val) {
 }
 
 
-__global__ void calculate_block_properties(const float* x, float* block_max, float* block_sum, int N) {
+__global__ void calculate_block_max_and_sum(const float* x, float* block_max, float* block_sum, int N) {
     extern __shared__ float s_mem[];
     int tid = threadIdx.x;
     int i = blockIdx.x * blockDim.x + tid;
@@ -95,7 +95,7 @@ __global__ void calculate_block_properties(const float* x, float* block_max, flo
 }
 
 
-__global__ void calculate_global_properties(float* block_maxes,
+__global__ void calculate_global_max_and_sum(float* block_maxes,
                                             float* block_sums,
                                             float* global_max_out,
                                             float* global_sum_out,
@@ -103,21 +103,17 @@ __global__ void calculate_global_properties(float* block_maxes,
     extern __shared__ float s_mem[];
     int tid = threadIdx.x;
     
-    // --- Step 1: Reduce to find GLOBAL MAX ---
     float thread_max = -1.0e30f;
     for (int i = tid; i < num_blocks; i += blockDim.x) {
         thread_max = fmaxf(thread_max, block_maxes[i]);
     }
     float global_max = block_reduce_max(thread_max);
     
-    // Broadcast global_max to all threads in the block
     if (tid == 0) s_mem[0] = global_max;
     __syncthreads();
     global_max = s_mem[0];
     __syncthreads();
 
-    // --- Step 2: Reduce to find GLOBAL SUM ---
-    // Use the now-known global_max to correctly scale the partial block sums
     float thread_sum = 0.0f;
     for (int i = tid; i < num_blocks; i += blockDim.x) {
         thread_sum += block_sums[i] * expf(block_maxes[i] - global_max);
@@ -135,7 +131,6 @@ __global__ void apply_softmax(const float* x, float* y, float global_max, float 
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
 
-    // Use a grid-stride loop for complete generality
     for (int j = i; j < N; j += stride) {
        y[j] = expf(x[j] - global_max) / global_sum;
     }
@@ -144,8 +139,8 @@ __global__ void apply_softmax(const float* x, float* y, float global_max, float 
 
 int main(int argc, char *argv[]) {
     int N = 10000000;  // Default value
-    int threadsPerBlock = 256; // Fixed for optimal performance
-    int num_blocks = 2048;
+    int threadsPerBlock = 512; // Fixed for optimal performance
+    int num_blocks = 1024;
 
     // Parse command line arguments
     if (argc > 1) {
@@ -156,7 +151,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    num_blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
+    // num_blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
     std::cout << "N " << N << " threads " << threadsPerBlock << " blocks " << num_blocks << std::endl;
     
     // Check CUDA grid limits
@@ -201,13 +196,12 @@ int main(int argc, char *argv[]) {
     
     cudaMemcpy(d_input, h_input, N * sizeof(float), cudaMemcpyHostToDevice);
     
-    calculate_block_properties<<<num_blocks, threadsPerBlock, sharedMemSize>>>(d_input, d_block_max, d_block_sum, N);
+    calculate_block_max_and_sum<<<num_blocks, threadsPerBlock, sharedMemSize>>>(d_input, d_block_max, d_block_sum, N);
 
     const int reduce_threads = REDUCE_BLOCK_SIZE;
     const int reduce_shared_mem = (reduce_threads / WARP_SIZE) * sizeof(float);
-    calculate_global_properties<<<1, reduce_threads, reduce_shared_mem>>>(d_block_max, d_block_sum, d_global_max, d_global_sum, num_blocks);
+    calculate_global_max_and_sum<<<1, reduce_threads, reduce_shared_mem>>>(d_block_max, d_block_sum, d_global_max, d_global_sum, num_blocks);
     
-    // Copy final max and sum to host to be passed by value to the final kernel
     cudaMemcpy(&gpu_max, d_global_max, sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(&gpu_sum, d_global_sum, sizeof(float), cudaMemcpyDeviceToHost);
 
