@@ -138,21 +138,34 @@ __global__ void apply_softmax(const float* x, float* y, float global_max, float 
 
 
 int main(int argc, char *argv[]) {
-    int N = 10000000;  // Default value
+    int N = 1000000;  // Default value
     int threadsPerBlock = 512; // Fixed for optimal performance
+    int num_runs_per_kernel = 1;
     int num_blocks = 1024;
 
-    // Parse command line arguments
-    if (argc > 1) {
-        N = atoi(argv[1]);
-        if (N <= 0) {
-            printf("Invalid N value: %d. Using default N = 10000000\n", N);
-            N = 10000000;
-        }
+    if (argc == 5) {
+        threadsPerBlock = std::atoi(argv[1]);
+        num_blocks = std::atoi(argv[2]);
+        num_runs_per_kernel = std::atoi(argv[3]);
+        N = std::atoi(argv[4]);
+    } else if (argc != 1) { // Allow no arguments for default values
+        std::cerr << "Usage: " << argv[0] << " <N> <threadsPerBlock> <num_blocks> <num_runs_per_kernel>" << std::endl;
+        std::cerr << "Using default values: N=" << N << ", threadsPerBlock=" << threadsPerBlock << ", num_blocks=" << num_blocks << ", num_runs_per_kernel=" << num_runs_per_kernel << std::endl;
+    }
+
+    // if num_blocks * threadsPerBlock > N, error out
+    if (num_blocks * threadsPerBlock > N) {
+        std::cerr << "Error: num_blocks * threadsPerBlock > N" << std::endl;
+        return -1;
+    }
+
+    if (threadsPerBlock > 1024) {
+        std::cerr << "Error: threadsPerBlock > 1024" << std::endl;
+        return -1;
     }
 
     // num_blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
-    std::cout << "N " << N << " threads " << threadsPerBlock << " blocks " << num_blocks << std::endl;
+    std::cout << "N " << N << " threads " << threadsPerBlock << " blocks " << num_blocks << " num_runs_per_kernel " << num_runs_per_kernel << std::endl;
     
     // Check CUDA grid limits
     cudaDeviceProp deviceProp;
@@ -196,16 +209,23 @@ int main(int argc, char *argv[]) {
     
     cudaMemcpy(d_input, h_input, N * sizeof(float), cudaMemcpyHostToDevice);
     
-    calculate_block_max_and_sum<<<num_blocks, threadsPerBlock, sharedMemSize>>>(d_input, d_block_max, d_block_sum, N);
+    for (int i = 0; i < num_runs_per_kernel; i++) {
+        calculate_block_max_and_sum<<<num_blocks, threadsPerBlock, sharedMemSize>>>(d_input, d_block_max, d_block_sum, N);
+    }
 
     const int reduce_threads = REDUCE_BLOCK_SIZE;
     const int reduce_shared_mem = (reduce_threads / WARP_SIZE) * sizeof(float);
-    calculate_global_max_and_sum<<<1, reduce_threads, reduce_shared_mem>>>(d_block_max, d_block_sum, d_global_max, d_global_sum, num_blocks);
+    
+    for (int i = 0; i < num_runs_per_kernel; i++) {
+        calculate_global_max_and_sum<<<1, reduce_threads, reduce_shared_mem>>>(d_block_max, d_block_sum, d_global_max, d_global_sum, num_blocks);
+    }
     
     cudaMemcpy(&gpu_max, d_global_max, sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(&gpu_sum, d_global_sum, sizeof(float), cudaMemcpyDeviceToHost);
 
-    apply_softmax<<<num_blocks, threadsPerBlock>>>(d_input, d_output, gpu_max, gpu_sum, N);
+    for (int i = 0; i < num_runs_per_kernel; i++) {
+        apply_softmax<<<num_blocks, threadsPerBlock>>>(d_input, d_output, gpu_max, gpu_sum, N);
+    }
 
     cudaMemcpy(h_output, d_output, N * sizeof(float), cudaMemcpyDeviceToHost);
 

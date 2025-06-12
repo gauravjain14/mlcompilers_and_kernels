@@ -5,6 +5,7 @@ import os
 import csv
 import time
 import sys
+import statistics
 
 def log(message, verbose=False):
     """Print message only if verbose mode is enabled"""
@@ -109,6 +110,8 @@ def run_profiling(args):
     print(f"Testing all combinations of:")
     print(f"  threadsPerBlock = {args.threads_per_block}")
     print(f"  num_blocks = {args.num_blocks}")
+    print(f"  num_runs_per_kernel = {args.num_runs_per_kernel}")
+    print(f"  N = {args.n}")
     
     if args.extra_args:
         print(f"Extra arguments: {' '.join(args.extra_args)}")
@@ -119,11 +122,12 @@ def run_profiling(args):
     
     for tpb in args.threads_per_block:
         for nb in args.num_blocks:
+            print(f"Profiling TPB={tpb}, NB={nb}... ", end="", flush=True)            
             report_filename_base = f"profile_{os.path.basename(executable_path)}_tpb{tpb}_nb{nb}"
             report_filename = f"{report_filename_base}.nsys-rep"
             
-            # Build command line arguments
-            cmd_args = [str(tpb), str(nb)]
+            # Build command line arguments for another_optimized_softmax.cu
+            cmd_args = [str(tpb), str(nb), str(args.num_runs_per_kernel), str(args.n)]
             if args.extra_args:
                 cmd_args.extend(args.extra_args)
             
@@ -135,7 +139,7 @@ def run_profiling(args):
                 "-o", report_filename,
                 executable_path
             ]
-            profile_command.extend(cmd_args)            
+            profile_command.extend(cmd_args)
             print(f"Profiling TPB={tpb}, NB={nb}... ", end="") # , flush=True)
             
             try:
@@ -151,7 +155,6 @@ def run_profiling(args):
                 metrics = extract_metrics_from_csv(report_filename, verbose=args.verbose)
                 
                 if metrics:
-                    # Store the metrics for this configuration
                     results.append({
                         'tpb': tpb, 
                         'nb': nb, 
@@ -161,8 +164,6 @@ def run_profiling(args):
                         'kernel_times': metrics['kernel_times'],
                         'api_times': metrics['api_times']
                     })
-                    
-                    print("Done")
                 else:
                     print(f"Failed to get metrics")
             except subprocess.CalledProcessError as e:
@@ -200,7 +201,7 @@ def run_profiling(args):
     
     # Print detailed breakdown for the best configuration
     print(f"\nBest Configuration: TPB={best_config['tpb']}, NB={best_config['nb']}")
-    print(f"GPU Kernel Time: {best_config['gpu_kernel_time']*1000:.3f} ms")
+    print(f"GPU Kernel Time: {best_config['gpu_kernel_time']*1000/args.num_runs_per_kernel:.3f} ms")
     print(f"CUDA API Time: {best_config['cuda_api_time']*1000:.3f} ms")
     print(f"Memory Copy Time: {best_config['memcpy_time']*1000:.3f} ms")
     
@@ -243,10 +244,14 @@ def parse_args():
     parser.add_argument('executable', type=str, help='Path to the CUDA executable to profile')
     
     # Optional arguments with defaults
-    parser.add_argument('--threads-per-block', '-t', type=int, nargs='+', default=[64, 128, 256, 512, 1024],
+    parser.add_argument('--threads-per-block', '-t', type=int, nargs='+', default=[256, 512],
                         help='List of threads per block values to test')
-    parser.add_argument('--num-blocks', '-b', type=int, nargs='+', default=[32, 64, 128, 256],
+    parser.add_argument('--num-blocks', '-b', type=int, nargs='+', default=[512, 1024],
                         help='List of number of blocks values to test')
+    parser.add_argument('--num-runs-per-kernel', '-r', type=int, default=10,
+                        help='Number of times each kernel runs within the executable (warmup + measurement)')
+    parser.add_argument('--n', '-n', type=int, default=1000000,
+                        help='Size of input array N for softmax computation')
     
     # Other options
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose output')
