@@ -97,6 +97,31 @@ def extract_metrics_from_csv(report_file, output_dir=".", verbose=False):
     
     return metrics
 
+def cleanup_existing_files(report_filename_base, verbose=False):
+    """Clean up existing profiling files with the same base name"""
+    files_to_clean = [
+        f"{report_filename_base}.nsys-rep",
+        f"{report_filename_base}.sqlite",
+        f"{report_filename_base}_cudaapisum.csv",
+        f"{report_filename_base}_gpukernsum.csv", 
+        f"{report_filename_base}_cudaapitrace.csv"
+    ]
+    
+    cleaned_files = []
+    for file_path in files_to_clean:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                cleaned_files.append(file_path)
+                log(f"Removed existing file: {file_path}", verbose)
+            except OSError as e:
+                log(f"Warning: Could not remove {file_path}: {e}", verbose)
+    
+    if cleaned_files and verbose:
+        log(f"Cleaned up {len(cleaned_files)} existing files for {report_filename_base}", verbose)
+    
+    return cleaned_files
+
 def run_profiling(args):
     """Run CUDA profiling with the specified arguments"""
     executable_path = args.executable
@@ -122,9 +147,11 @@ def run_profiling(args):
     
     for tpb in args.threads_per_block:
         for nb in args.num_blocks:
-            print(f"Profiling TPB={tpb}, NB={nb}... ", end="", flush=True)            
             report_filename_base = f"profile_{os.path.basename(executable_path)}_tpb{tpb}_nb{nb}"
             report_filename = f"{report_filename_base}.nsys-rep"
+            
+            # Clean up existing files
+            cleanup_existing_files(report_filename_base, verbose=args.verbose)
             
             # Build command line arguments for another_optimized_softmax.cu
             cmd_args = [str(tpb), str(nb), str(args.num_runs_per_kernel), str(args.n)]
@@ -140,7 +167,7 @@ def run_profiling(args):
                 executable_path
             ]
             profile_command.extend(cmd_args)
-            print(f"Profiling TPB={tpb}, NB={nb}... ", end="") # , flush=True)
+            print(f"Profiling TPB={tpb}, NB={nb}... ", end="", flush=True)
             
             try:
                 if args.verbose:
