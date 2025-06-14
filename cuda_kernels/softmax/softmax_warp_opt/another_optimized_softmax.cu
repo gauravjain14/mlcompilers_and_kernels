@@ -211,6 +211,7 @@ int main(int argc, char *argv[]) {
     
     for (int i = 0; i < num_runs_per_kernel; i++) {
         calculate_block_max_and_sum<<<num_blocks, threadsPerBlock, sharedMemSize>>>(d_input, d_block_max, d_block_sum, N);
+        cudaDeviceSynchronize();
     }
 
     const int reduce_threads = REDUCE_BLOCK_SIZE;
@@ -218,6 +219,7 @@ int main(int argc, char *argv[]) {
     
     for (int i = 0; i < num_runs_per_kernel; i++) {
         calculate_global_max_and_sum<<<1, reduce_threads, reduce_shared_mem>>>(d_block_max, d_block_sum, d_global_max, d_global_sum, num_blocks);
+        cudaDeviceSynchronize();
     }
     
     cudaMemcpy(&gpu_max, d_global_max, sizeof(float), cudaMemcpyDeviceToHost);
@@ -225,6 +227,7 @@ int main(int argc, char *argv[]) {
 
     for (int i = 0; i < num_runs_per_kernel; i++) {
         apply_softmax<<<num_blocks, threadsPerBlock>>>(d_input, d_output, gpu_max, gpu_sum, N);
+        cudaDeviceSynchronize();
     }
 
     cudaMemcpy(h_output, d_output, N * sizeof(float), cudaMemcpyDeviceToHost);
